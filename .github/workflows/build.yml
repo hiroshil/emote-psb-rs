@@ -1,0 +1,87 @@
+name: build-example-cli
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-example:
+    name: Build emote-psb example CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+            artifact_name: emote-psb-x86_64-unknown-linux-gnu
+            asset_name: emote-psb-x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+            artifact_name: emote-psb-x86_64-pc-windows-msvc
+            asset_name: emote-psb-x86_64-pc-windows-msvc.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build example release binary
+        run: cargo build --release --example emote-psb --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          src="target/${{ matrix.target }}/release/examples/emote-psb${{ matrix.exe }}"
+          dst="dist/${{ matrix.asset_name }}"
+
+          cp "$src" "$dst"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "$dst"
+          fi
+
+          python - "$dst" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          path.with_name(path.name + ".sha256").write_text(
+              f"{digest}  {path.name}\n",
+              encoding="utf-8",
+          )
+          PY
+
+          ls -la dist
+
+      - name: Upload example binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.asset_name }}.sha256
+          if-no-files-found: error
