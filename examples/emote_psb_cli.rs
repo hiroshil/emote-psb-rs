@@ -4,20 +4,22 @@ use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom,
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use byteorder::{LittleEndian, WriteBytesExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use emote_psb::{
-    mdf::{MdfReader, MdfWriter},
+    mdf::{MdfReader, MdfShell, MdfWriter},
     psb::{read::PsbFile, write::PsbWriter},
     value::PsbValue,
     PSB_MDF_SIGNATURE, PSB_SIGNATURE,
 };
+use flate2::{write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "emote-psb",
     version,
-    about = "Inspect, dump, pack, unpack, and convert E-mote PSB/MDF files."
+    about = "Inspect, dump, pack, unpack, convert, and repack E-mote PSB/MDF files."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,11 +31,14 @@ enum Command {
     /// Show high-level file metadata.
     Info {
         input: PathBuf,
+
         #[arg(long, value_enum, default_value_t = InputFormat::Auto)]
         format: InputFormat,
+
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -41,14 +46,18 @@ enum Command {
     /// Dump the PSB root object as JSON.
     Dump {
         input: PathBuf,
+
         #[arg(long, value_enum, default_value_t = InputFormat::Auto)]
         format: InputFormat,
+
         /// Output JSON path. Prints to stdout when omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -57,15 +66,19 @@ enum Command {
     Build {
         root_json: PathBuf,
         output: PathBuf,
+
         /// PSB version. Valid values are 2, 3, and 4.
         #[arg(long, default_value_t = 3)]
         version: u16,
+
         /// Mark output PSB as encrypted.
         #[arg(long)]
         encrypted: bool,
+
         /// Add normal resource file. Repeat to preserve indices.
         #[arg(long = "resource", value_name = "FILE")]
         resources: Vec<PathBuf>,
+
         /// Add extra resource file. Repeat to preserve indices. Requires version 4.
         #[arg(long = "extra", value_name = "FILE")]
         extras: Vec<PathBuf>,
@@ -75,14 +88,18 @@ enum Command {
     Repack {
         input: PathBuf,
         output: PathBuf,
+
         #[arg(long, value_enum, default_value_t = InputFormat::Auto)]
         format: InputFormat,
+
         /// Override output PSB version. Defaults to source version.
         #[arg(long)]
         version: Option<u16>,
+
         /// Override output encrypted flag.
         #[arg(long, value_name = "BOOL")]
         encrypted: Option<bool>,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -91,14 +108,18 @@ enum Command {
     Unpack {
         input: PathBuf,
         out_dir: PathBuf,
+
         #[arg(long, value_enum, default_value_t = InputFormat::Auto)]
         format: InputFormat,
+
         /// Overwrite an existing non-empty output directory.
         #[arg(long)]
         overwrite: bool,
+
         /// Pretty-print generated root.json and manifest.json.
         #[arg(long)]
         pretty: bool,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -107,18 +128,23 @@ enum Command {
     Pack {
         manifest_json: PathBuf,
         output: PathBuf,
+
         /// Override manifest root JSON path.
         #[arg(long)]
         root: Option<PathBuf>,
+
         /// Override manifest resources. Repeat to preserve indices.
         #[arg(long = "resource", value_name = "FILE")]
         resources: Vec<PathBuf>,
+
         /// Override manifest extra resources. Repeat to preserve indices. Requires version 4.
         #[arg(long = "extra", value_name = "FILE")]
         extras: Vec<PathBuf>,
+
         /// Override manifest version.
         #[arg(long)]
         version: Option<u16>,
+
         /// Override manifest encrypted flag.
         #[arg(long, value_name = "BOOL")]
         encrypted: Option<bool>,
@@ -128,6 +154,7 @@ enum Command {
     DecodeMdf {
         input: PathBuf,
         output: PathBuf,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -136,6 +163,7 @@ enum Command {
     EncodeMdf {
         input: PathBuf,
         output: PathBuf,
+
         /// zlib compression level passed to MdfWriter.
         #[arg(long, default_value_t = 6)]
         level: u32,
@@ -145,13 +173,17 @@ enum Command {
     Convert {
         input: PathBuf,
         output: PathBuf,
+
         #[arg(long = "from", value_enum, default_value_t = InputFormat::Auto)]
         from_format: InputFormat,
+
         #[arg(long = "to", value_enum, default_value_t = OutputFormat::Auto)]
         to_format: OutputFormat,
+
         /// zlib compression level used when writing MDF.
         #[arg(long, default_value_t = 6)]
         level: u32,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -160,17 +192,22 @@ enum Command {
     ArchiveInfo {
         /// Archive info PSB/MDF file, for example scenario_info.psb.m.
         info: PathBuf,
+
         /// Archive body file, for example scenario_body.bin.
         body: PathBuf,
+
         /// Output JSON report path. Prints to stdout when omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+
         /// Pretty-print JSON.
         #[arg(long)]
         pretty: bool,
+
         /// Decode each MDF body slice and validate the decoded PSB signature.
         #[arg(long)]
         deep: bool,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
@@ -179,39 +216,134 @@ enum Command {
     ArchiveUnpack {
         /// Archive info PSB/MDF file, for example scenario_info.psb.m.
         info: PathBuf,
+
         /// Archive body file, for example scenario_body.bin.
         body: PathBuf,
+
         /// Output directory.
         out_dir: PathBuf,
+
         /// Overwrite an existing non-empty output directory.
         #[arg(long)]
         overwrite: bool,
+
         /// Pretty-print generated JSON files.
         #[arg(long)]
         pretty: bool,
+
         /// Also write the original body slices before MDF decoding.
         #[arg(long)]
         raw_slices: bool,
+
         /// Abort on the first entry-level extraction error.
         #[arg(long)]
         strict: bool,
+
+        #[command(flatten)]
+        mdf: MdfCliOptions,
+    },
+
+    /// Repack an MArchive pair after editing files extracted by `archive-unpack`.
+    RepackArchive {
+        /// Original archive info PSB/MDF file, for example scenario_info.psb.m.
+        info: PathBuf,
+
+        /// Original archive body file, for example scenario_body.bin.
+        body: PathBuf,
+
+        /// Directory produced by `archive-unpack`, or a FreeMote-like source directory.
+        in_dir: PathBuf,
+
+        /// Output archive info PSB/MDF file.
+        out_info: PathBuf,
+
+        /// Output archive body file.
+        out_body: PathBuf,
+
+        /// Output format for out_info. Auto treats `.psb.m`, `.m`, and `.mdf` as MDF.
+        #[arg(long = "info-format", value_enum, default_value_t = OutputFormat::Auto)]
+        info_format: OutputFormat,
+
+        /// zlib compression level used for rewritten MDF body slices and MDF info output.
+        #[arg(long, default_value_t = 6)]
+        level: u32,
+
+        /// Output shell for rewritten MDF body slices.
+        #[arg(long = "body-mdf-shell", value_enum, default_value_t = MdfWriteShell::Auto)]
+        body_mdf_shell: MdfWriteShell,
+
+        /// Output shell for out_info when it is MDF.
+        #[arg(long = "info-mdf-shell", value_enum, default_value_t = MdfWriteShell::Auto)]
+        info_mdf_shell: MdfWriteShell,
+
+        /// MT19937 seed variant used when writing MT19937 MDF.
+        #[arg(long = "mt-seed-variant", value_enum, default_value_t = MtSeedVariantCli::Md5ArrayLe)]
+        mt_seed_variant: MtSeedVariantCli,
+
+        /// MT19937 XOR key variant used when writing MT19937 MDF.
+        #[arg(long = "mt-key-variant", value_enum, default_value_t = MtKeyVariantCli::CyclicLeWords)]
+        mt_key_variant: MtKeyVariantCli,
+
+        /// Preserve original raw body slice when no replacement is found.
+        #[arg(long, default_value_t = true)]
+        preserve_missing: bool,
+
+        /// Abort if an entry has no replacement in in_dir.
+        #[arg(long)]
+        strict: bool,
+
+        /// Prefer raw_slices/*.slice over decoded entries/*.psb or entries/*.bin.
+        #[arg(long)]
+        prefer_raw_slices: bool,
+
+        /// Preserve source offset order. Use `--free-mote-order` to sort by archive name.
+        #[arg(long = "free-mote-order")]
+        free_mote_order: bool,
+
+        /// Override the output MDF seed name for out_info. Defaults to out_info file name.
+        #[arg(long = "info-mdf-name")]
+        info_mdf_name: Option<String>,
+
         #[command(flatten)]
         mdf: MdfCliOptions,
     },
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum InputFormat {
     Auto,
     Psb,
     Mdf,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
     Auto,
     Psb,
     Mdf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MdfWriteShell {
+    Auto,
+    Plain,
+    Mt19937,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MtSeedVariantCli {
+    Md5ArrayLe,
+    Md5ArrayBe,
+    Md5FirstLe,
+    Md5FirstBe,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MtKeyVariantCli {
+    CyclicLeWords,
+    CyclicBeWords,
+    StreamLeWords,
+    StreamBeWords,
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -278,8 +410,10 @@ struct PackageManifest {
 #[derive(Debug, Serialize, Deserialize)]
 struct ArchiveInfoRoot {
     id: Option<String>,
+
     #[serde(default)]
     expire_suffix_list: Vec<String>,
+
     file_info: BTreeMap<String, Vec<u64>>,
 }
 
@@ -418,6 +552,43 @@ fn main() -> Result<()> {
             strict,
             mdf,
         } => archive_unpack_command(info, body, out_dir, overwrite, pretty, raw_slices, strict, mdf),
+        Command::RepackArchive {
+            info,
+            body,
+            in_dir,
+            out_info,
+            out_body,
+            info_format,
+            level,
+            body_mdf_shell,
+            info_mdf_shell,
+            mt_seed_variant,
+            mt_key_variant,
+            preserve_missing,
+            strict,
+            prefer_raw_slices,
+            free_mote_order,
+            info_mdf_name,
+            mdf,
+        } => repack_archive_command(
+            info,
+            body,
+            in_dir,
+            out_info,
+            out_body,
+            info_format,
+            level,
+            body_mdf_shell,
+            info_mdf_shell,
+            mt_seed_variant,
+            mt_key_variant,
+            preserve_missing,
+            strict,
+            prefer_raw_slices,
+            free_mote_order,
+            info_mdf_name,
+            mdf,
+        ),
     }
 }
 
@@ -592,6 +763,7 @@ fn unpack_command(
         resources: resource_files,
         extra_resources: extra_files,
     };
+
     write_json_output(&manifest, Some(&out_dir.join("manifest.json")), pretty)
 }
 
@@ -635,7 +807,6 @@ fn pack_command(
     let extras = read_blobs(&extra_paths)?;
     let version = validate_version(version_override.unwrap_or(manifest.version))?;
     let encrypted = encrypted_override.unwrap_or(manifest.encrypted);
-
     write_psb_file(&output, version, encrypted, &root, &resources, &extras)
 }
 
@@ -673,7 +844,6 @@ fn convert_command(
     }
 }
 
-
 fn archive_info_command(
     info: PathBuf,
     body: PathBuf,
@@ -709,6 +879,137 @@ fn archive_unpack_command(
     write_json_output(&report, Some(&out_dir.join("manifest.json")), pretty)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn repack_archive_command(
+    info: PathBuf,
+    body: PathBuf,
+    in_dir: PathBuf,
+    out_info: PathBuf,
+    out_body: PathBuf,
+    info_format: OutputFormat,
+    level: u32,
+    body_mdf_shell: MdfWriteShell,
+    info_mdf_shell: MdfWriteShell,
+    mt_seed_variant: MtSeedVariantCli,
+    mt_key_variant: MtKeyVariantCli,
+    preserve_missing: bool,
+    strict: bool,
+    prefer_raw_slices: bool,
+    free_mote_order: bool,
+    info_mdf_name: Option<String>,
+    mdf: MdfCliOptions,
+) -> Result<()> {
+    let level = validate_compression_level(level)?;
+    let info_kind = detect_file_kind(&info)?;
+    let source_info_shell = if info_kind == FileKind::Mdf {
+        Some(decode_mdf_to_vec_with_shell(&info, &mdf)?.1)
+    } else {
+        None
+    };
+
+    let mut info_psb = open_as_psb_file(&info, info_kind, &mdf)
+        .with_context(|| format!("failed to read archive info {}", info.display()))?;
+    let info_version = info_psb.version;
+    let info_encrypted = info_psb.encrypted;
+    let root_value = info_psb
+        .deserialize_root::<PsbValue>()
+        .context("failed to deserialize archive info PSB root")?;
+
+    let archive_root: ArchiveInfoRoot = serde_json::from_value(
+        serde_json::to_value(&root_value).context("failed to convert archive root to JSON")?,
+    )
+    .context("archive info root does not match expected MArchive schema")?;
+
+    if archive_root.id.as_deref() != Some("archive") {
+        bail!(
+            "archive info root id is {:?}, expected \"archive\"",
+            archive_root.id
+        );
+    }
+
+    let suffix = archive_root
+        .expire_suffix_list
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    let mut entries = archive_entries(&archive_root, &suffix)?;
+    if free_mote_order {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        for (idx, entry) in entries.iter_mut().enumerate() {
+            entry.index = idx;
+        }
+    }
+
+    let mut body_out = BufWriter::new(
+        File::create(&out_body).with_context(|| format!("failed to create {}", out_body.display()))?,
+    );
+    let mut new_file_info: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut offset = 0u64;
+
+    for entry in &entries {
+        let original_slice = read_body_slice(&body, entry.offset, entry.length)
+            .with_context(|| format!("failed to read original slice {}", entry.name))?;
+        let original_kind = detect_slice_kind(&original_slice);
+        let replacement = find_archive_replacement(&in_dir, entry, prefer_raw_slices);
+
+        let packed = match replacement {
+            Some(path) => pack_archive_replacement(
+                &path,
+                &original_slice,
+                original_kind,
+                entry,
+                &mdf,
+                level,
+                body_mdf_shell,
+                mt_seed_variant,
+                mt_key_variant,
+            )
+            .with_context(|| format!("failed to pack replacement for {}", entry.name))?,
+            None if strict || !preserve_missing => {
+                bail!("missing replacement for archive entry {}", entry.name);
+            }
+            None => original_slice,
+        };
+
+        body_out
+            .write_all(&packed)
+            .with_context(|| format!("failed to write body slice {}", entry.name))?;
+
+        let length = u64::try_from(packed.len()).context("body slice length does not fit in u64")?;
+        new_file_info.insert(entry.name.clone(), vec![offset, length]);
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("archive body offset overflow"))?;
+    }
+
+    body_out.flush().context("failed to flush output body")?;
+
+    let mut new_root_json =
+        serde_json::to_value(&root_value).context("failed to convert archive root to JSON")?;
+    let file_info = new_root_json
+        .get_mut("file_info")
+        .ok_or_else(|| anyhow!("archive root has no file_info field"))?;
+    *file_info = serde_json::to_value(&new_file_info).context("failed to rebuild file_info")?;
+
+    let new_root: PsbValue = serde_json::from_value(new_root_json)
+        .context("failed to convert rebuilt archive root to PsbValue")?;
+
+    write_archive_info_output(
+        &out_info,
+        info_format,
+        info_version,
+        info_encrypted,
+        &new_root,
+        level,
+        &mdf,
+        source_info_shell,
+        info_mdf_shell,
+        mt_seed_variant,
+        mt_key_variant,
+        info_mdf_name.as_deref(),
+    )
+}
+
 fn read_archive_root(info_path: &Path, mdf: &MdfCliOptions) -> Result<(ArchiveInfoRoot, PsbValue)> {
     let info_kind = detect_file_kind(info_path)?;
     let mut psb = open_as_psb_file(info_path, info_kind, mdf)
@@ -720,12 +1021,14 @@ fn read_archive_root(info_path: &Path, mdf: &MdfCliOptions) -> Result<(ArchiveIn
         serde_json::to_value(&root_value).context("failed to convert archive info root to JSON")?,
     )
     .context("archive info root does not match expected MArchive schema")?;
+
     if archive_root.id.as_deref() != Some("archive") {
         bail!(
             "archive info root id is {:?}, expected \"archive\"",
             archive_root.id
         );
     }
+
     Ok((archive_root, root_value))
 }
 
@@ -754,8 +1057,9 @@ fn build_archive_report(
         fs::create_dir_all(dir.join("entries"))
             .with_context(|| format!("failed to create {}", dir.join("entries").display()))?;
         if raw_slices {
-            fs::create_dir_all(dir.join("raw_slices"))
-                .with_context(|| format!("failed to create {}", dir.join("raw_slices").display()))?;
+            fs::create_dir_all(dir.join("raw_slices")).with_context(|| {
+                format!("failed to create {}", dir.join("raw_slices").display())
+            })?;
         }
     }
 
@@ -792,11 +1096,21 @@ fn build_archive_report(
             error: None,
         };
 
-        let result = process_archive_entry(body_path, &entry, mdf, deep, extract_dir, raw_slices, &mut report);
+        let result = process_archive_entry(
+            body_path,
+            &entry,
+            mdf,
+            deep,
+            extract_dir,
+            raw_slices,
+            &mut report,
+        );
         if let Err(err) = result {
             let message = err.to_string();
             if strict {
-                return Err(err).with_context(|| format!("failed to process archive entry {}", entry.name));
+                return Err(err).with_context(|| {
+                    format!("failed to process archive entry {}", entry.name)
+                });
             }
             errors.push(format!("{}: {}", entry.name, message));
             report.error = Some(message);
@@ -826,9 +1140,14 @@ fn build_archive_report(
 
 fn archive_entries(root: &ArchiveInfoRoot, suffix: &str) -> Result<Vec<ArchiveEntry>> {
     let mut entries = Vec::with_capacity(root.file_info.len());
+
     for (name, pair) in &root.file_info {
         if pair.len() < 2 {
-            bail!("file_info entry {} has {} values, expected at least 2", name, pair.len());
+            bail!(
+                "file_info entry {} has {} values, expected at least 2",
+                name,
+                pair.len()
+            );
         }
         entries.push(ArchiveEntry {
             index: 0,
@@ -838,10 +1157,12 @@ fn archive_entries(root: &ArchiveInfoRoot, suffix: &str) -> Result<Vec<ArchiveEn
             seed_name: archive_entry_seed_name(name, suffix),
         });
     }
+
     entries.sort_by_key(|entry| entry.offset);
     for (idx, entry) in entries.iter_mut().enumerate() {
         entry.index = idx;
     }
+
     Ok(entries)
 }
 
@@ -907,6 +1228,86 @@ fn process_archive_entry(
     Ok(())
 }
 
+fn pack_archive_replacement(
+    path: &Path,
+    original_slice: &[u8],
+    original_kind: ArchiveSliceKind,
+    entry: &ArchiveEntry,
+    mdf: &MdfCliOptions,
+    level: u8,
+    body_mdf_shell: MdfWriteShell,
+    seed_variant: MtSeedVariantCli,
+    key_variant: MtKeyVariantCli,
+) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+
+    if is_raw_slice_path(path) {
+        return Ok(bytes);
+    }
+
+    match original_kind {
+        ArchiveSliceKind::Mdf => {
+            let shell = resolve_mdf_write_shell(body_mdf_shell, Some(MdfShell::Mt19937), mdf);
+            match shell {
+                MdfWriteShell::Plain => encode_plain_mdf_to_vec(&bytes, level),
+                MdfWriteShell::Mt19937 => encode_mt19937_mdf_to_vec(
+                    &bytes,
+                    mdf,
+                    &entry.seed_name,
+                    level,
+                    seed_variant,
+                    key_variant,
+                ),
+                MdfWriteShell::Auto => unreachable!("resolve_mdf_write_shell never returns Auto"),
+            }
+        }
+        ArchiveSliceKind::Psb | ArchiveSliceKind::Psz | ArchiveSliceKind::Raw => {
+            if detect_slice_kind(original_slice) == ArchiveSliceKind::Mdf {
+                encode_plain_mdf_to_vec(&bytes, level)
+            } else {
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+fn find_archive_replacement(
+    in_dir: &Path,
+    entry: &ArchiveEntry,
+    prefer_raw_slices: bool,
+) -> Option<PathBuf> {
+    let safe = sanitize_file_name(&entry.name);
+    let numbered = format!("{idx:04}_{safe}", idx = entry.index, safe = safe);
+    let mut candidates = Vec::new();
+
+    if prefer_raw_slices {
+        candidates.push(in_dir.join("raw_slices").join(format!("{numbered}.slice")));
+    }
+
+    candidates.extend([
+        in_dir.join("entries").join(format!("{numbered}.psb")),
+        in_dir.join("entries").join(format!("{numbered}.bin")),
+        in_dir.join(&entry.name),
+        in_dir.join(&entry.seed_name),
+        in_dir.join(format!("{}.psb", entry.name)),
+        in_dir.join(format!("{}.bin", entry.name)),
+        in_dir.join(format!("{}.json", entry.name)),
+    ]);
+
+    if !prefer_raw_slices {
+        candidates.push(in_dir.join("raw_slices").join(format!("{numbered}.slice")));
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn is_raw_slice_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("slice"))
+        .unwrap_or(false)
+}
+
 fn read_body_slice(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>> {
     let length_usize = usize::try_from(length).context("body slice length does not fit in usize")?;
     let mut file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -959,13 +1360,16 @@ fn mdf_original_size(slice: &[u8]) -> Option<u32> {
 }
 
 fn has_psb_signature(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && u32::from_le_bytes(bytes[0..4].try_into().expect("slice length checked")) == PSB_SIGNATURE
+    bytes.len() >= 4
+        && u32::from_le_bytes(bytes[0..4].try_into().expect("slice length checked"))
+            == PSB_SIGNATURE
 }
 
 fn sanitize_file_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
-        let bad = matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || ch.is_control();
+        let bad = matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            || ch.is_control();
         if bad {
             out.push('_');
         } else {
@@ -985,17 +1389,26 @@ fn require_mdf_key(mdf: &MdfCliOptions) -> Result<&str> {
         .ok_or_else(|| anyhow!("archive body MDF slices require --mdf-key"))
 }
 
-fn open_as_psb_file(path: &Path, kind: FileKind, mdf: &MdfCliOptions) -> Result<PsbFile<BufReader<Cursor<Vec<u8>>>>> {
+fn open_as_psb_file(
+    path: &Path,
+    kind: FileKind,
+    mdf: &MdfCliOptions,
+) -> Result<PsbFile<BufReader<Cursor<Vec<u8>>>>> {
     let psb_bytes = match kind {
         FileKind::Psb => fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
         FileKind::Mdf => decode_mdf_to_vec(path, mdf)?,
     };
-    ensure_psb_signature(&psb_bytes).with_context(|| format!("{} did not decode to PSB", path.display()))?;
+    ensure_psb_signature(&psb_bytes)
+        .with_context(|| format!("{} did not decode to PSB", path.display()))?;
     let cursor = Cursor::new(psb_bytes);
     PsbFile::open(BufReader::new(cursor)).context("failed to open PSB")
 }
 
-fn open_mdf_reader<R>(reader: R, path: &Path, options: &MdfCliOptions) -> std::result::Result<MdfReader, emote_psb::mdf::error::MdfOpenError>
+fn open_mdf_reader<R>(
+    reader: R,
+    path: &Path,
+    options: &MdfCliOptions,
+) -> std::result::Result<MdfReader, emote_psb::mdf::error::MdfOpenError>
 where
     R: BufRead,
 {
@@ -1016,14 +1429,23 @@ where
 }
 
 fn decode_mdf_to_vec(path: &Path, mdf_options: &MdfCliOptions) -> Result<Vec<u8>> {
+    let (decoded, _) = decode_mdf_to_vec_with_shell(path, mdf_options)?;
+    ensure_psb_signature(&decoded)?;
+    Ok(decoded)
+}
+
+fn decode_mdf_to_vec_with_shell(
+    path: &Path,
+    mdf_options: &MdfCliOptions,
+) -> Result<(Vec<u8>, MdfShell)> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut mdf = open_mdf_reader(reader, path, mdf_options).context("failed to open MDF")?;
+    let shell = mdf.shell();
     let mut decoded = Vec::new();
     mdf.read_to_end(&mut decoded)
         .context("failed to decompress MDF")?;
-    ensure_psb_signature(&decoded)?;
-    Ok(decoded)
+    Ok((decoded, shell))
 }
 
 fn write_psb_file(
@@ -1048,6 +1470,7 @@ fn write_psb_file(
             .add_resource(Cursor::new(bytes.clone()))
             .with_context(|| format!("failed to add resource {idx}"))?;
     }
+
     for (idx, bytes) in extras.iter().enumerate() {
         writer
             .add_extra(Cursor::new(bytes.clone()))
@@ -1056,6 +1479,41 @@ fn write_psb_file(
 
     writer.finish().context("failed to write PSB")?;
     Ok(())
+}
+
+fn build_psb_vec(
+    version: u16,
+    encrypted: bool,
+    root: &PsbValue,
+    resources: &[Vec<u8>],
+    extras: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    if !extras.is_empty() && version <= 3 {
+        bail!("extra resources require PSB version 4; got version {version}");
+    }
+
+    let mut out = Vec::new();
+    {
+        let cursor = Cursor::new(&mut out);
+        let mut writer = PsbWriter::new(version, encrypted, root, cursor)
+            .context("failed to initialize PSB writer")?;
+
+        for (idx, bytes) in resources.iter().enumerate() {
+            writer
+                .add_resource(Cursor::new(bytes.clone()))
+                .with_context(|| format!("failed to add resource {idx}"))?;
+        }
+
+        for (idx, bytes) in extras.iter().enumerate() {
+            writer
+                .add_extra(Cursor::new(bytes.clone()))
+                .with_context(|| format!("failed to add extra resource {idx}"))?;
+        }
+
+        writer.finish().context("failed to write PSB")?;
+    }
+
+    Ok(out)
 }
 
 fn write_mdf_file(output: &Path, psb_bytes: &[u8], level: u32) -> Result<()> {
@@ -1067,6 +1525,123 @@ fn write_mdf_file(output: &Path, psb_bytes: &[u8], level: u32) -> Result<()> {
     let mut stream = writer.finish().context("failed to finish MDF")?;
     stream.flush().context("failed to flush MDF output")?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_archive_info_output(
+    output: &Path,
+    format: OutputFormat,
+    version: u16,
+    encrypted: bool,
+    root: &PsbValue,
+    level: u8,
+    mdf: &MdfCliOptions,
+    source_info_shell: Option<MdfShell>,
+    requested_shell: MdfWriteShell,
+    seed_variant: MtSeedVariantCli,
+    key_variant: MtKeyVariantCli,
+    info_mdf_name: Option<&str>,
+) -> Result<()> {
+    let kind = resolve_output_kind(output, format)?;
+    match kind {
+        FileKind::Psb => write_psb_file(output, version, encrypted, root, &[], &[]),
+        FileKind::Mdf => {
+            let psb_bytes = build_psb_vec(version, encrypted, root, &[], &[])?;
+            let shell = resolve_mdf_write_shell(requested_shell, source_info_shell, mdf);
+            let bytes = match shell {
+                MdfWriteShell::Plain => encode_plain_mdf_to_vec(&psb_bytes, level)?,
+                MdfWriteShell::Mt19937 => {
+                    let seed_name = info_mdf_name
+                        .map(ToOwned::to_owned)
+                        .or_else(|| output.file_name().and_then(|name| name.to_str()).map(ToOwned::to_owned))
+                        .ok_or_else(|| anyhow!("cannot derive output info MDF seed name"))?;
+                    encode_mt19937_mdf_to_vec(
+                        &psb_bytes,
+                        mdf,
+                        &seed_name,
+                        level,
+                        seed_variant,
+                        key_variant,
+                    )?
+                }
+                MdfWriteShell::Auto => unreachable!("resolve_mdf_write_shell never returns Auto"),
+            };
+            fs::write(output, bytes)
+                .with_context(|| format!("failed to write {}", output.display()))
+        }
+    }
+}
+
+fn resolve_mdf_write_shell(
+    requested: MdfWriteShell,
+    source_shell: Option<MdfShell>,
+    mdf: &MdfCliOptions,
+) -> MdfWriteShell {
+    match requested {
+        MdfWriteShell::Plain | MdfWriteShell::Mt19937 => requested,
+        MdfWriteShell::Auto => match source_shell {
+            Some(MdfShell::Mt19937) if mdf.key.is_some() || mdf.seed.is_some() => MdfWriteShell::Mt19937,
+            _ => MdfWriteShell::Plain,
+        },
+    }
+}
+
+fn encode_plain_mdf_to_vec(bytes: &[u8], level: u8) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = MdfWriter::new(cursor, level).context("failed to initialize MDF writer")?;
+    writer.write_all(bytes).context("failed to write MDF payload")?;
+    let cursor = writer.finish().context("failed to finish MDF payload")?;
+    Ok(cursor.into_inner())
+}
+
+fn encode_mt19937_mdf_to_vec(
+    bytes: &[u8],
+    mdf: &MdfCliOptions,
+    seed_name: &str,
+    level: u8,
+    seed_variant: MtSeedVariantCli,
+    key_variant: MtKeyVariantCli,
+) -> Result<Vec<u8>> {
+    let seed = resolve_output_seed(mdf, seed_name)?;
+    let key_len = if mdf.key_len == 0 {
+        bail!("invalid MDF MT19937 key length 0")
+    } else {
+        mdf.key_len
+    };
+
+    let mut zlib_payload = Vec::new();
+    {
+        let mut encoder = ZlibEncoder::new(&mut zlib_payload, Compression::new(level as u32));
+        encoder
+            .write_all(bytes)
+            .context("failed to zlib-compress MDF payload")?;
+        encoder.finish().context("failed to finish zlib payload")?;
+    }
+
+    let encrypted = mt19937_xor(
+        &zlib_payload,
+        seed.as_bytes(),
+        key_len,
+        seed_variant.into(),
+        key_variant.into(),
+    );
+
+    let original_len = u32::try_from(bytes.len()).context("MDF original length exceeds u32")?;
+    let mut out = Vec::with_capacity(8 + encrypted.len());
+    out.write_u32::<LittleEndian>(PSB_MDF_SIGNATURE)?;
+    out.write_u32::<LittleEndian>(original_len)?;
+    out.extend_from_slice(&encrypted);
+    Ok(out)
+}
+
+fn resolve_output_seed(mdf: &MdfCliOptions, seed_name: &str) -> Result<String> {
+    if let Some(seed) = &mdf.seed {
+        Ok(seed.clone())
+    } else if let Some(key) = &mdf.key {
+        Ok(format!("{key}{seed_name}"))
+    } else {
+        bail!("MT19937 MDF output requires --mdf-key or --mdf-seed")
+    }
 }
 
 fn read_all_normal_resource_sizes<S>(psb: &mut PsbFile<S>) -> Result<Vec<usize>>
@@ -1154,8 +1729,7 @@ fn prepare_output_dir(path: &Path, overwrite: bool) -> Result<()> {
             bail!("{} exists and is not a directory", path.display());
         }
         if overwrite {
-            fs::remove_dir_all(path)
-                .with_context(|| format!("failed to clear {}", path.display()))?;
+            fs::remove_dir_all(path).with_context(|| format!("failed to clear {}", path.display()))?;
             fs::create_dir_all(path)
                 .with_context(|| format!("failed to recreate {}", path.display()))?;
         } else if path.read_dir()?.next().is_some() {
@@ -1165,8 +1739,7 @@ fn prepare_output_dir(path: &Path, overwrite: bool) -> Result<()> {
             );
         }
     } else {
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
+        fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
     }
     Ok(())
 }
@@ -1236,19 +1809,25 @@ fn resolve_output_kind(path: &Path, requested: OutputFormat) -> Result<FileKind>
     match requested {
         OutputFormat::Psb => Ok(FileKind::Psb),
         OutputFormat::Mdf => Ok(FileKind::Mdf),
-        OutputFormat::Auto => match path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("mdf") => Ok(FileKind::Mdf),
-            Some("psb") | Some("scn") => Ok(FileKind::Psb),
-            _ => Err(anyhow!(
-                "cannot infer output format from {}; pass --to psb or --to mdf",
-                path.display()
-            )),
-        },
+        OutputFormat::Auto => {
+            let lower = path.to_string_lossy().to_ascii_lowercase();
+            if lower.ends_with(".psb.m") || lower.ends_with(".m") || lower.ends_with(".mdf") {
+                Ok(FileKind::Mdf)
+            } else {
+                match path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("psb") | Some("scn") => Ok(FileKind::Psb),
+                    _ => Err(anyhow!(
+                        "cannot infer output format from {}; pass an explicit format",
+                        path.display()
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -1258,6 +1837,7 @@ fn detect_file_kind(path: &Path) -> Result<FileKind> {
     file.read_exact(&mut sig)
         .with_context(|| format!("failed to read signature from {}", path.display()))?;
     let sig = u32::from_le_bytes(sig);
+
     match sig {
         PSB_SIGNATURE => Ok(FileKind::Psb),
         PSB_MDF_SIGNATURE => Ok(FileKind::Mdf),
@@ -1278,4 +1858,362 @@ fn ensure_psb_signature(bytes: &[u8]) -> Result<()> {
     } else {
         bail!("invalid PSB signature 0x{sig:08x}")
     }
+}
+
+#[derive(Clone, Copy)]
+enum MtSeedVariant {
+    Md5ArrayLe,
+    Md5ArrayBe,
+    Md5FirstLe,
+    Md5FirstBe,
+}
+
+#[derive(Clone, Copy)]
+enum MtKeyVariant {
+    CyclicLeWords,
+    CyclicBeWords,
+    StreamLeWords,
+    StreamBeWords,
+}
+
+impl From<MtSeedVariantCli> for MtSeedVariant {
+    fn from(value: MtSeedVariantCli) -> Self {
+        match value {
+            MtSeedVariantCli::Md5ArrayLe => Self::Md5ArrayLe,
+            MtSeedVariantCli::Md5ArrayBe => Self::Md5ArrayBe,
+            MtSeedVariantCli::Md5FirstLe => Self::Md5FirstLe,
+            MtSeedVariantCli::Md5FirstBe => Self::Md5FirstBe,
+        }
+    }
+}
+
+impl From<MtKeyVariantCli> for MtKeyVariant {
+    fn from(value: MtKeyVariantCli) -> Self {
+        match value {
+            MtKeyVariantCli::CyclicLeWords => Self::CyclicLeWords,
+            MtKeyVariantCli::CyclicBeWords => Self::CyclicBeWords,
+            MtKeyVariantCli::StreamLeWords => Self::StreamLeWords,
+            MtKeyVariantCli::StreamBeWords => Self::StreamBeWords,
+        }
+    }
+}
+
+fn mt19937_xor(
+    payload: &[u8],
+    seed: &[u8],
+    key_len: usize,
+    seed_variant: MtSeedVariant,
+    key_variant: MtKeyVariant,
+) -> Vec<u8> {
+    let digest = md5(seed);
+    let mut mt = match seed_variant {
+        MtSeedVariant::Md5ArrayLe => {
+            let keys = [
+                u32::from_le_bytes(digest[0..4].try_into().expect("slice length")),
+                u32::from_le_bytes(digest[4..8].try_into().expect("slice length")),
+                u32::from_le_bytes(digest[8..12].try_into().expect("slice length")),
+                u32::from_le_bytes(digest[12..16].try_into().expect("slice length")),
+            ];
+            Mt19937::from_key_array(&keys)
+        }
+        MtSeedVariant::Md5ArrayBe => {
+            let keys = [
+                u32::from_be_bytes(digest[0..4].try_into().expect("slice length")),
+                u32::from_be_bytes(digest[4..8].try_into().expect("slice length")),
+                u32::from_be_bytes(digest[8..12].try_into().expect("slice length")),
+                u32::from_be_bytes(digest[12..16].try_into().expect("slice length")),
+            ];
+            Mt19937::from_key_array(&keys)
+        }
+        MtSeedVariant::Md5FirstLe => Mt19937::new(u32::from_le_bytes(
+            digest[0..4].try_into().expect("slice length"),
+        )),
+        MtSeedVariant::Md5FirstBe => Mt19937::new(u32::from_be_bytes(
+            digest[0..4].try_into().expect("slice length"),
+        )),
+    };
+
+    match key_variant {
+        MtKeyVariant::CyclicLeWords => xor_with_cyclic_key(payload, key_len, &mut mt, true),
+        MtKeyVariant::CyclicBeWords => xor_with_cyclic_key(payload, key_len, &mut mt, false),
+        MtKeyVariant::StreamLeWords => xor_with_stream(payload, &mut mt, true),
+        MtKeyVariant::StreamBeWords => xor_with_stream(payload, &mut mt, false),
+    }
+}
+
+fn xor_with_cyclic_key(
+    payload: &[u8],
+    key_len: usize,
+    mt: &mut Mt19937,
+    little_endian: bool,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(key_len);
+    while key.len() < key_len {
+        let n = mt.next_u32();
+        let bytes = if little_endian {
+            n.to_le_bytes()
+        } else {
+            n.to_be_bytes()
+        };
+        key.extend_from_slice(&bytes);
+    }
+    key.truncate(key_len);
+
+    payload
+        .iter()
+        .enumerate()
+        .map(|(idx, byte)| byte ^ key[idx % key.len()])
+        .collect()
+}
+
+fn xor_with_stream(payload: &[u8], mt: &mut Mt19937, little_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut key = [0u8; 4];
+    let mut key_idx = 4;
+
+    for byte in payload {
+        if key_idx >= 4 {
+            let n = mt.next_u32();
+            key = if little_endian {
+                n.to_le_bytes()
+            } else {
+                n.to_be_bytes()
+            };
+            key_idx = 0;
+        }
+        out.push(byte ^ key[key_idx]);
+        key_idx += 1;
+    }
+
+    out
+}
+
+struct Mt19937 {
+    mt: [u32; 624],
+    index: usize,
+}
+
+impl Mt19937 {
+    fn new(seed: u32) -> Self {
+        let mut mt = [0u32; 624];
+        mt[0] = seed;
+        for i in 1..624 {
+            mt[i] = 1_812_433_253u32
+                .wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 30))
+                .wrapping_add(i as u32);
+        }
+        Self { mt, index: 624 }
+    }
+
+    fn from_key_array(key: &[u32]) -> Self {
+        let mut rng = Self::new(19_650_218);
+        let mut i = 1usize;
+        let mut j = 0usize;
+        let mut k = 624usize.max(key.len());
+        while k > 0 {
+            rng.mt[i] = (rng.mt[i]
+                ^ ((rng.mt[i - 1] ^ (rng.mt[i - 1] >> 30)).wrapping_mul(1_664_525)))
+            .wrapping_add(key[j])
+            .wrapping_add(j as u32);
+            i += 1;
+            j += 1;
+            if i >= 624 {
+                rng.mt[0] = rng.mt[623];
+                i = 1;
+            }
+            if j >= key.len() {
+                j = 0;
+            }
+            k -= 1;
+        }
+
+        k = 623;
+        while k > 0 {
+            rng.mt[i] = (rng.mt[i]
+                ^ ((rng.mt[i - 1] ^ (rng.mt[i - 1] >> 30)).wrapping_mul(1_566_083_941)))
+            .wrapping_sub(i as u32);
+            i += 1;
+            if i >= 624 {
+                rng.mt[0] = rng.mt[623];
+                i = 1;
+            }
+            k -= 1;
+        }
+
+        rng.mt[0] = 0x8000_0000;
+        rng.index = 624;
+        rng
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        const N: usize = 624;
+        const M: usize = 397;
+        const MATRIX_A: u32 = 0x9908_b0df;
+        const UPPER_MASK: u32 = 0x8000_0000;
+        const LOWER_MASK: u32 = 0x7fff_ffff;
+
+        if self.index >= N {
+            for kk in 0..(N - M) {
+                let y = (self.mt[kk] & UPPER_MASK) | (self.mt[kk + 1] & LOWER_MASK);
+                self.mt[kk] = self.mt[kk + M]
+                    ^ (y >> 1)
+                    ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+            }
+            for kk in (N - M)..(N - 1) {
+                let y = (self.mt[kk] & UPPER_MASK) | (self.mt[kk + 1] & LOWER_MASK);
+                self.mt[kk] = self.mt[kk + M - N]
+                    ^ (y >> 1)
+                    ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+            }
+            let y = (self.mt[N - 1] & UPPER_MASK) | (self.mt[0] & LOWER_MASK);
+            self.mt[N - 1] = self.mt[M - 1]
+                ^ (y >> 1)
+                ^ if y & 1 != 0 { MATRIX_A } else { 0 };
+            self.index = 0;
+        }
+
+        let mut y = self.mt[self.index];
+        self.index += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^= y >> 18;
+        y
+    }
+}
+
+fn md5(input: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4,
+        11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
+    ];
+
+    let mut msg = input.to_vec();
+    let bit_len = (msg.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_le_bytes());
+
+    let mut a0 = 0x6745_2301u32;
+    let mut b0 = 0xefcd_ab89u32;
+    let mut c0 = 0x98ba_dcfeu32;
+    let mut d0 = 0x1032_5476u32;
+
+    for chunk in msg.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, word) in m.iter_mut().enumerate() {
+            let start = i * 4;
+            *word = u32::from_le_bytes(chunk[start..start + 4].try_into().expect("slice length"));
+        }
+
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+
+        for i in 0..64 {
+            let (f, g) = if i < 16 {
+                ((b & c) | ((!b) & d), i)
+            } else if i < 32 {
+                ((d & b) | ((!d) & c), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (b ^ c ^ d, (3 * i + 5) % 16)
+            } else {
+                (c ^ (b | (!d)), (7 * i) % 16)
+            };
+
+            let temp = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(
+                a.wrapping_add(f)
+                    .wrapping_add(K[i])
+                    .wrapping_add(m[g])
+                    .rotate_left(S[i]),
+            );
+            a = temp;
+        }
+
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
 }
