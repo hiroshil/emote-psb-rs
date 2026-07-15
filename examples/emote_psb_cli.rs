@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use emote_psb::{
     mdf::{MdfReader, MdfShell, MdfWriter},
     psb::{read::PsbFile, write::PsbWriter},
@@ -188,13 +188,14 @@ enum Command {
         mdf: MdfCliOptions,
     },
 
-    /// Inspect an MArchive pair: `{archive}_info.psb.m` plus `{archive}_body.bin`.
+    /// Inspect an MArchive pair. Pass the `*_info.psb.m`; the matching `*_body.bin` is inferred.
     ArchiveInfo {
         /// Archive info PSB/MDF file, for example scenario_info.psb.m.
         info: PathBuf,
 
-        /// Archive body file, for example scenario_body.bin.
-        body: PathBuf,
+        /// Archive body file. Defaults to `{prefix}_body.bin` next to `{prefix}_info.psb.m`.
+        #[arg(long)]
+        body: Option<PathBuf>,
 
         /// Output JSON report path. Prints to stdout when omitted.
         #[arg(short, long)]
@@ -212,16 +213,17 @@ enum Command {
         mdf: MdfCliOptions,
     },
 
-    /// Extract all slices from an MArchive body using the decoded info manifest.
+    /// Extract all slices from an MArchive using the decoded info manifest.
     ArchiveUnpack {
-        /// Archive info PSB/MDF file, for example scenario_info.psb.m.
+        /// Archive info PSB/MDF file, for example scenario_info.psb.m. The body defaults to scenario_body.bin in the same directory.
         info: PathBuf,
 
-        /// Archive body file, for example scenario_body.bin.
-        body: PathBuf,
-
-        /// Output directory.
+        /// Output directory. By default, writes editable files directly under this directory using original archive names.
         out_dir: PathBuf,
+
+        /// Archive body file. Defaults to `{prefix}_body.bin` next to `{prefix}_info.psb.m`.
+        #[arg(long)]
+        body: Option<PathBuf>,
 
         /// Overwrite an existing non-empty output directory.
         #[arg(long)]
@@ -235,6 +237,14 @@ enum Command {
         #[arg(long)]
         raw_slices: bool,
 
+        /// Compatibility no-op: named entries are now written by default.
+        #[arg(long, hide = true, action = ArgAction::SetTrue)]
+        named_entries: bool,
+
+        /// Also write legacy numbered decoded entries, for example entries/0038_startup.bin. Disabled by default.
+        #[arg(long = "indexed-entries")]
+        indexed_entries: bool,
+
         /// Abort on the first entry-level extraction error.
         #[arg(long)]
         strict: bool,
@@ -245,20 +255,22 @@ enum Command {
 
     /// Repack an MArchive pair after editing files extracted by `archive-unpack`.
     RepackArchive {
-        /// Original archive info PSB/MDF file, for example scenario_info.psb.m.
+        /// Original archive info PSB/MDF file, for example scenario_info.psb.m. The original body defaults to scenario_body.bin in the same directory.
         info: PathBuf,
-
-        /// Original archive body file, for example scenario_body.bin.
-        body: PathBuf,
 
         /// Directory produced by `archive-unpack`, or a FreeMote-like source directory.
         in_dir: PathBuf,
 
-        /// Output archive info PSB/MDF file.
+        /// Output archive info PSB/MDF file. The output body defaults to the matching `*_body.bin` next to this path.
         out_info: PathBuf,
 
-        /// Output archive body file.
-        out_body: PathBuf,
+        /// Original archive body file. Defaults to `{prefix}_body.bin` next to the input info file.
+        #[arg(long)]
+        body: Option<PathBuf>,
+
+        /// Output archive body file. Defaults to `{prefix}_body.bin` next to the output info file.
+        #[arg(long = "out-body")]
+        out_body: Option<PathBuf>,
 
         /// Output format for out_info. Auto treats `.psb.m`, `.m`, and `.mdf` as MDF.
         #[arg(long = "info-format", value_enum, default_value_t = OutputFormat::Auto)]
@@ -458,6 +470,7 @@ struct ArchiveEntryReport {
     decoded_size: Option<usize>,
     psb_signature_ok: Option<bool>,
     output: Option<PathBuf>,
+    named_output: Option<PathBuf>,
     raw_output: Option<PathBuf>,
     error: Option<String>,
 }
@@ -544,19 +557,32 @@ fn main() -> Result<()> {
         } => archive_info_command(info, body, output, pretty, deep, mdf),
         Command::ArchiveUnpack {
             info,
+            out_dir,
+            body,
+            overwrite,
+            pretty,
+            raw_slices,
+            named_entries: _named_entries_compat,
+            indexed_entries,
+            strict,
+            mdf,
+        } => archive_unpack_command(
+            info,
             body,
             out_dir,
             overwrite,
             pretty,
             raw_slices,
+            true,
+            indexed_entries,
             strict,
             mdf,
-        } => archive_unpack_command(info, body, out_dir, overwrite, pretty, raw_slices, strict, mdf),
+        ),
         Command::RepackArchive {
             info,
-            body,
             in_dir,
             out_info,
+            body,
             out_body,
             info_format,
             level,
@@ -846,7 +872,7 @@ fn convert_command(
 
 fn archive_info_command(
     info: PathBuf,
-    body: PathBuf,
+    body: Option<PathBuf>,
     output: Option<PathBuf>,
     pretty: bool,
     deep: bool,
@@ -855,37 +881,55 @@ fn archive_info_command(
     if deep {
         require_mdf_key(&mdf)?;
     }
-    let report = build_archive_report(&info, &body, &mdf, deep, None, false, false)?;
+    let body = resolve_archive_body_input_path(body.as_deref(), &info)?;
+    let report = build_archive_report(&info, &body, &mdf, deep, None, false, false, false, false)?;
     write_json_output(&report, output.as_deref(), pretty)
 }
 
 fn archive_unpack_command(
     info: PathBuf,
-    body: PathBuf,
+    body: Option<PathBuf>,
     out_dir: PathBuf,
     overwrite: bool,
     pretty: bool,
     raw_slices: bool,
+    named_entries: bool,
+    indexed_entries: bool,
     strict: bool,
     mdf: MdfCliOptions,
 ) -> Result<()> {
     require_mdf_key(&mdf)?;
+    let body = resolve_archive_body_input_path(body.as_deref(), &info)?;
     prepare_output_dir(&out_dir, overwrite)?;
 
-    let (_archive_root, root_value) = read_archive_root(&info, &mdf)?;
-    write_json_output(&root_value, Some(&out_dir.join("info_root.json")), pretty)?;
+    let metadata_dir = out_dir.join(".emote_archive");
+    fs::create_dir_all(&metadata_dir)
+        .with_context(|| format!("failed to create {}", metadata_dir.display()))?;
 
-    let report = build_archive_report(&info, &body, &mdf, true, Some(&out_dir), raw_slices, strict)?;
-    write_json_output(&report, Some(&out_dir.join("manifest.json")), pretty)
+    let (_archive_root, root_value) = read_archive_root(&info, &mdf)?;
+    write_json_output(&root_value, Some(&metadata_dir.join("info_root.json")), pretty)?;
+
+    let report = build_archive_report(
+        &info,
+        &body,
+        &mdf,
+        true,
+        Some(&out_dir),
+        raw_slices,
+        named_entries,
+        indexed_entries,
+        strict,
+    )?;
+    write_json_output(&report, Some(&metadata_dir.join("manifest.json")), pretty)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn repack_archive_command(
     info: PathBuf,
-    body: PathBuf,
+    body: Option<PathBuf>,
     in_dir: PathBuf,
     out_info: PathBuf,
-    out_body: PathBuf,
+    out_body: Option<PathBuf>,
     info_format: OutputFormat,
     level: u32,
     body_mdf_shell: MdfWriteShell,
@@ -900,6 +944,8 @@ fn repack_archive_command(
     mdf: MdfCliOptions,
 ) -> Result<()> {
     let level = validate_compression_level(level)?;
+    let body = resolve_archive_body_input_path(body.as_deref(), &info)?;
+    let out_body = resolve_archive_body_output_path(out_body.as_deref(), &out_info)?;
     let info_kind = detect_file_kind(&info)?;
     let source_info_shell = if info_kind == FileKind::Mdf {
         Some(decode_mdf_to_vec_with_shell(&info, &mdf)?.1)
@@ -1010,6 +1056,55 @@ fn repack_archive_command(
     )
 }
 
+
+fn resolve_archive_body_input_path(explicit: Option<&Path>, info: &Path) -> Result<PathBuf> {
+    let body = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => archive_body_path_from_info_path(info)?,
+    };
+
+    if !body.is_file() {
+        bail!(
+            "archive body file {} was not found; pass --body explicitly if it is not next to the info file",
+            body.display()
+        );
+    }
+
+    Ok(body)
+}
+
+fn resolve_archive_body_output_path(explicit: Option<&Path>, out_info: &Path) -> Result<PathBuf> {
+    match explicit {
+        Some(path) => Ok(path.to_path_buf()),
+        None => archive_body_path_from_info_path(out_info),
+    }
+}
+
+fn archive_body_path_from_info_path(info: &Path) -> Result<PathBuf> {
+    let file_name = info
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("cannot infer archive body path from {}", info.display()))?;
+
+    let body_name = file_name
+        .strip_suffix("_info.psb.m")
+        .or_else(|| file_name.strip_suffix("_info.mdf"))
+        .or_else(|| file_name.strip_suffix("_info.psb"))
+        .or_else(|| file_name.strip_suffix("_info.m"))
+        .map(|prefix| format!("{prefix}_body.bin"))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot infer archive body path from {}; expected a file name ending with _info.psb.m, _info.mdf, _info.psb, or _info.m",
+                info.display()
+            )
+        })?;
+
+    Ok(info
+        .parent()
+        .map(|parent| parent.join(&body_name))
+        .unwrap_or_else(|| PathBuf::from(body_name)))
+}
+
 fn read_archive_root(info_path: &Path, mdf: &MdfCliOptions) -> Result<(ArchiveInfoRoot, PsbValue)> {
     let info_kind = detect_file_kind(info_path)?;
     let mut psb = open_as_psb_file(info_path, info_kind, mdf)
@@ -1039,6 +1134,8 @@ fn build_archive_report(
     deep: bool,
     extract_dir: Option<&Path>,
     raw_slices: bool,
+    named_entries: bool,
+    indexed_entries: bool,
     strict: bool,
 ) -> Result<ArchiveReport> {
     let (archive_root, _) = read_archive_root(info_path, mdf)?;
@@ -1054,8 +1151,10 @@ fn build_archive_report(
         .len();
 
     if let Some(dir) = extract_dir {
-        fs::create_dir_all(dir.join("entries"))
-            .with_context(|| format!("failed to create {}", dir.join("entries").display()))?;
+        if indexed_entries {
+            fs::create_dir_all(dir.join("entries"))
+                .with_context(|| format!("failed to create {}", dir.join("entries").display()))?;
+        }
         if raw_slices {
             fs::create_dir_all(dir.join("raw_slices")).with_context(|| {
                 format!("failed to create {}", dir.join("raw_slices").display())
@@ -1092,6 +1191,7 @@ fn build_archive_report(
             decoded_size: None,
             psb_signature_ok: None,
             output: None,
+            named_output: None,
             raw_output: None,
             error: None,
         };
@@ -1103,6 +1203,8 @@ fn build_archive_report(
             deep,
             extract_dir,
             raw_slices,
+            named_entries,
+            indexed_entries,
             &mut report,
         );
         if let Err(err) = result {
@@ -1173,6 +1275,8 @@ fn process_archive_entry(
     deep: bool,
     extract_dir: Option<&Path>,
     raw_slices: bool,
+    named_entries: bool,
+    indexed_entries: bool,
     report: &mut ArchiveEntryReport,
 ) -> Result<()> {
     let slice = read_body_slice(body_path, entry.offset, entry.length)?;
@@ -1213,16 +1317,30 @@ fn process_archive_entry(
     };
 
     if let (Some(dir), Some(bytes)) = (extract_dir, decoded) {
-        let ext = if has_psb_signature(&bytes) { "psb" } else { "bin" };
-        let rel = PathBuf::from("entries").join(format!(
-            "{idx:04}_{name}.{ext}",
-            idx = entry.index,
-            name = sanitize_file_name(&entry.name),
-            ext = ext
-        ));
-        fs::write(dir.join(&rel), bytes)
-            .with_context(|| format!("failed to write {}", dir.join(&rel).display()))?;
-        report.output = Some(rel);
+        if indexed_entries {
+            let ext = if has_psb_signature(&bytes) { "psb" } else { "bin" };
+            let rel = PathBuf::from("entries").join(format!(
+                "{idx:04}_{name}.{ext}",
+                idx = entry.index,
+                name = sanitize_file_name(&entry.name),
+                ext = ext
+            ));
+            fs::write(dir.join(&rel), &bytes)
+                .with_context(|| format!("failed to write {}", dir.join(&rel).display()))?;
+            report.output = Some(rel);
+        }
+
+        if named_entries {
+            let named_rel = editable_archive_entry_path(entry);
+            let named_path = dir.join(&named_rel);
+            if let Some(parent) = named_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::write(&named_path, &bytes)
+                .with_context(|| format!("failed to write {}", named_path.display()))?;
+            report.named_output = Some(named_rel);
+        }
     }
 
     Ok(())
@@ -1284,7 +1402,13 @@ fn find_archive_replacement(
         candidates.push(in_dir.join("raw_slices").join(format!("{numbered}.slice")));
     }
 
+    let editable_rel = editable_archive_entry_path(entry);
+    let editable_name = editable_archive_entry_name(entry);
     candidates.extend([
+        in_dir.join(&editable_rel),
+        in_dir.join(&editable_name),
+        in_dir.join("named_entries").join(&editable_rel),
+        in_dir.join("named_entries").join(&entry.seed_name),
         in_dir.join("entries").join(format!("{numbered}.psb")),
         in_dir.join("entries").join(format!("{numbered}.bin")),
         in_dir.join(&entry.name),
@@ -1336,6 +1460,43 @@ fn archive_entry_seed_name(name: &str, suffix: &str) -> String {
         name.to_string()
     } else {
         format!("{name}{suffix}")
+    }
+}
+
+fn editable_archive_entry_name(entry: &ArchiveEntry) -> String {
+    editable_name_from_seed_name(&entry.seed_name)
+}
+
+fn editable_archive_entry_path(entry: &ArchiveEntry) -> PathBuf {
+    safe_relative_archive_path(&editable_archive_entry_name(entry))
+}
+
+fn editable_name_from_seed_name(seed_name: &str) -> String {
+    seed_name
+        .strip_suffix(".m")
+        .unwrap_or(seed_name)
+        .to_string()
+}
+
+fn safe_relative_archive_path(name: &str) -> PathBuf {
+    let normalized = name.replace('\\', "/");
+    let mut path = PathBuf::new();
+
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            path.push("_");
+        } else {
+            path.push(sanitize_file_name(part));
+        }
+    }
+
+    if path.as_os_str().is_empty() {
+        PathBuf::from("entry")
+    } else {
+        path
     }
 }
 
